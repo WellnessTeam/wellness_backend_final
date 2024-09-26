@@ -8,12 +8,17 @@ from services.auth_service import validate_token
 from db.models import Food_List, Recommend, Total_Today, History, Meal_Type, User, Auth, Log
 from sqlalchemy import func
 from decimal import Decimal
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from schemas.user import UserCreate
 import schemas
 from core.logging import logger
 from schemas.log import LogCreate
 import json
+import jwt
+import pytz
+import hashlib
+from sqlalchemy import delete
+
 
 # 공통 예외 처리 헬퍼 함수
 async def execute_db_operation(db: AsyncSession, operation):
@@ -25,69 +30,122 @@ async def execute_db_operation(db: AsyncSession, operation):
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"Database operation failed: {str(e)}")
     
-    # 민감한 정보 마스킹 함수
-def mask_token(token: str) -> str:
-    return token[:10] + '*' * (len(token) - 10) if token else token
+def hash_token(token: str) -> str:
+    """토큰을 해시화하는 함수"""
+    return hashlib.sha256(token.encode()).hexdigest()
 
 def mask_email(email: str) -> str:
+    """이메일을 마스킹하는 함수, '@' 기호만 남기고 나머지는 '*'로 처리"""
+    if not email or '@' not in email:
+        return '*' * len(email) if email else ''
+    
     parts = email.split('@')
-    return f"{parts[0][:3]}{'*' * (len(parts[0]) - 3)}@{parts[1]}" if email else email
+    masked_local = '*' * len(parts[0])
+    masked_domain = '*' * len(parts[1])
+    
+    return f"{masked_local}@{masked_domain}"
 
-def mask_nickname(nickname: str) -> str:
-    return nickname[:1] + '*' * (len(nickname) - 1) if nickname else nickname
+def mask_nickname(user_nickname: str) -> str:
+    """닉네임을 완전히 마스킹하는 함수"""
+    return '*' * len(user_nickname) if user_nickname else ''
 
-# 로그 생성 함수
-async def create_log(db: AsyncSession, log: LogCreate):
+def mask_birthday(birthday: str) -> str:
+    """생년월일을 마스킹하는 함수, '-' 기호는 유지"""
+    if not birthday:
+        return ''
+    
+    parts = birthday.split('-')
+    masked_parts = ['*' * len(part) for part in parts]
+    return '-'.join(masked_parts)
+
+def secure_jwt_decode(token: str, secret_key: str) -> dict:
     try:
-        # JSON 데이터를 파싱
+        decoded = jwt.decode(token, secret_key, algorithms=["HS256"])
+        if 'user_email' in decoded:
+            decoded['user_email'] = mask_email(decoded['user_email'])
+        return decoded
+    except jwt.ExpiredSignatureError:
+        return {"error": "Token has expired"}
+    except jwt.InvalidTokenError:
+        return {"error": "Invalid token"}
+
+def process_token_for_logging(token: str, secret_key: str) -> dict:
+    token_hash = hash_token(token)
+    decoded_info = secure_jwt_decode(token, secret_key)
+    return {
+        "token_hash": token_hash,
+        "decoded_info": decoded_info
+    }
+
+async def create_log(db: AsyncSession, log: LogCreate, jwt_secret_key: str):
+    try:
+        # 요청 파라미터 처리
+        req_param = json.loads(log.req_param) if log.req_param else {}
+        
+        # 응답 파라미터 처리
         res_param = json.loads(log.res_param)
         
-        # 민감한 정보 마스킹
-        if 'detail' in res_param and 'wellness_info' in res_param['detail']:
-            wellness_info = res_param['detail']['wellness_info']
-            wellness_info['access_token'] = mask_token(wellness_info.get('access_token'))
-            wellness_info['refresh_token'] = mask_token(wellness_info.get('refresh_token'))
-            wellness_info['user_email'] = mask_email(wellness_info.get('user_email'))
-            wellness_info['user_nickname'] = mask_nickname(wellness_info.get('user_nickname'))
+        # 요청 및 응답 파라미터 마스킹/해싱 함수
+        def process_params(param):
+            if isinstance(param, dict):
+                for key, value in param.items():
+                    if key in ['access_token', 'refresh_token']:
+                        param[key] = hash_token(value)
+                    elif key == 'user_email':
+                        param[key] = mask_email(value)
+                    elif key == 'user_nickname':
+                        param[key] = mask_nickname(value)
+                    elif key == 'user_birthday':
+                        param[key] = mask_birthday(value)
+                    elif isinstance(value, (dict, list)):
+                        param[key] = process_params(value)
+            elif isinstance(param, list):
+                return [process_params(item) for item in param]
+            return param
         
-        # 마스킹된 데이터를 다시 JSON 문자열로 변환
-        masked_res_param = json.dumps(res_param)
+        # 요청 파라미터 처리
+        masked_req_param = process_params(req_param)
+        
+        # 응답 파라미터 처리
+        masked_res_param = process_params(res_param)
+        
+        masked_req_param = json.dumps(masked_req_param)
+        masked_res_param = json.dumps(masked_res_param)
     except json.JSONDecodeError:
-        # JSON 파싱에 실패한 경우, 원본 데이터를 그대로 사용
+        masked_req_param = log.req_param
         masked_res_param = log.res_param
     except Exception as e:
-        logger.error(f"Error during log masking: {str(e)}")
+        print(f"Error during log processing: {str(e)}")
+        masked_req_param = log.req_param
         masked_res_param = log.res_param
-        
-    naive_time_stamp = log.time_stamp.replace(tzinfo=None)
-
 
     db_log = Log(
         req_url=log.req_url,
         method=log.method,
-        req_param=log.req_param,
-        res_param=masked_res_param,  # 마스킹된 데이터 사용
+        req_param=masked_req_param,
+        res_param=masked_res_param,
         msg=log.msg,
         code=log.code,
-        time_stamp=naive_time_stamp
+        time_stamp=log.time_stamp
     )
     db.add(db_log)
     await db.commit()
     await db.refresh(db_log)
     return db_log
 
-# 로그 조회 함수
+
 async def get_daily_logs(session: AsyncSession, timestamp: datetime):
-    # 여기서는 timestamp를 UTC 형식으로 그대로 사용
+    # 여기서는 timestamp를 그대로 사용 UTC 형식.
     statement = select(Log).where(Log.time_stamp >= timestamp)
     result = await session.execute(statement)
     return result.scalars().all()
 
-# 오래된 로그 삭제 함수
+
 async def delete_old_logs(session: AsyncSession, days: int):
     cutoff_time = datetime.now(pytz.utc) - timedelta(days=days)
     statement = delete(Log).where(Log.time_stamp < cutoff_time)
     await session.execute(statement)
+
 
 # 사용자의 마지막 업데이트 기록 조회
 async def get_user_updated_at(db: AsyncSession, current_user: User):
