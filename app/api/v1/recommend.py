@@ -65,6 +65,20 @@ async def get_recommend_eaten(
     else:
         raise HTTPException(status_code=404, detail="total_today not found")
     
+    
+    # 오늘 날짜와 조회한 날짜가 다른 경우 영양소 값을 0으로 설정
+    if date_obj != datetime.now().date():
+        total_today.total_kcal = Decimal(0)
+        total_today.total_car = Decimal(0)
+        total_today.total_prot = Decimal(0)
+        total_today.total_fat = Decimal(0)
+        logger.info(f"Date is not today. Nutrient values set to 0 for {current_user.nickname}")
+
+    if total_today is not None:
+        total_today.condition = total_today.total_kcal > recommendation.rec_kcal
+    else:
+        raise HTTPException(status_code=404, detail="total_today not found")
+    
     # total_today 업데이트 (비동기 처리)
     try:
         await crud.update_total_today(db, total_today)
@@ -80,13 +94,13 @@ async def get_recommend_eaten(
                 "wellness_recommend_info": {
                     "user_nickname": current_user.nickname,
                     "total_kcal": decimal_to_float(total_today.total_kcal),
-                    "total_car": decimal_to_float(total_today.total_car),
-                    "total_prot": decimal_to_float(total_today.total_prot),
-                    "total_fat": decimal_to_float(total_today.total_fat),
+                    "total_car": round(decimal_to_float(total_today.total_car)),
+                    "total_prot": round(decimal_to_float(total_today.total_prot)),
+                    "total_fat": round(decimal_to_float(total_today.total_fat)),
                     "rec_kcal": decimal_to_float(recommendation.rec_kcal),
-                    "rec_car": decimal_to_float(recommendation.rec_car),
-                    "rec_prot": decimal_to_float(recommendation.rec_prot),
-                    "rec_fat": decimal_to_float(recommendation.rec_fat),
+                    "rec_car": round(decimal_to_float(recommendation.rec_car)),
+                    "rec_prot": round(decimal_to_float(recommendation.rec_prot)),
+                    "rec_fat": round(decimal_to_float(recommendation.rec_fat)),
                     "condition": total_today.condition
                 }
             },
@@ -94,3 +108,4 @@ async def get_recommend_eaten(
         },
         media_type="application/json; charset=utf-8"
     )
+    
