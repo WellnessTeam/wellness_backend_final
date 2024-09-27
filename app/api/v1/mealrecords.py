@@ -24,7 +24,7 @@ async def get_meal_records(
 
     # 오늘 날짜로 설정
     if today is None:
-        today = datetime.now(KST).date().strftime("%Y-%m-%d %H:%M:%S")
+        today = datetime.now(KST).date()
         logger.info(f"No date provided; usi ng today's date in KST: {today}")
 
     try:
